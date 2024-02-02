@@ -1,0 +1,195 @@
+#define _GNU_SOURCE //برای اینکه از یک سری قابلیت های لینوکس بهره ببریم
+// This macro is defined to ensure that all GNU-specific extensions are included when system header files are included.
+
+#include <stdio.h> //برای توابع پرینت و اسکن
+#include <stdlib.h> //برای توابع به صورت کلی مثل آزادسازی حافظه
+#include <dirent.h>  // For directory traversal برای استفاده از دایرکتوری های مختلف
+#include <pthread.h> // For threading برای چند رشته ای کار کردن برنامه
+#include <sys/types.h>
+#include <unistd.h>
+#include <string.h>
+#include <sys/time.h> // For measuring execution time
+#include <regex.h>    // For regular expression support
+
+#define MAX_THREADS 256  // Maximum number of threads ایجاد محدودیت برای اینکه بیش از حد ترد ایجاد نشه و پرفرمنس کاهش پیدا نکنه
+#define MAX_PATH 1024    // Maximum path length //حداکثر طول آدرس فایل که برای بسیاری از فایلها کافی است.
+
+// Structure to hold arguments for file processing threads
+typedef struct { //نگهداری آرگومان های مورد نیاز برای هر رشته ای که مسئول پردازش فایلهاست
+    char file_path[MAX_PATH]; // Path of the file to search
+    char *search_str;         // Regex pattern to search for 
+    // سرچ رشته یک متغیر سراسری است و آرایه ای از کاراکتر ها می باشد تا زمانیکه یک حافظه ی معتبر را تخصیص ندهیم به چیز خاصی اشاره نمیکند
+    int thread_num;           // Thread number (for identification) عددی منحصر به فرد برای ردیابی رشته
+} file_thread_args;
+
+// Structure to hold search results
+typedef struct {
+    int line;                 // Line number where match was found
+    int character;            // Character offset in line where match was found
+    char file_path[MAX_PATH]; // Path of the file where match was found
+} search_result;
+
+search_result results[MAX_THREADS]; // Array to store search results
+//در نظر گیری ماکسیمم ترد با فرض اینکه هر رشته ممکن است حداکثر یک نتیجه تولید کند. اگه نتایج مورد انتظار کمتر از تعداد رشته هاست میتوانیم مقدار آن را کمتر کنیم.
+int result_count = 0;               // Count of search results found
+int total_files_checked = 0;        // Count of total files checked
+pthread_mutex_t result_mutex;       // Mutex for synchronizing access to shared resources
+//اطمینان از اینکه تنها یک ترد میتواند به منابع اشتراکی دسترسی داشته باشد که در اینجا شامل resultcount,total_files_checked,result array میباشد.
+//هنگامیکه یک ترد آپدیت میکند باید ابتدا موتکس را قفل کند و سپس آزاد کند
+//جلوگیری از ریس کاندیشن و تولید داده ی نامعتبر
+
+// Function declarations
+void *search_file(void *args);
+void process_directory(const char *path, const char *search_str);
+void add_result(int line, int character, const char *file_path);
+
+int main(int argc, char *argv[]) {
+    // Check for correct number of arguments
+    if (argc != 3) {
+        fprintf(stderr, "Usage: %s <directory> <string>\n", argv[0]);
+        return EXIT_FAILURE;
+    }
+
+    // Initialize mutex
+    pthread_mutex_init(&result_mutex, NULL);
+    // Start processing the directory with the provided search string
+    process_directory(argv[1], argv[2]);
+
+    // Output the search results
+    printf("Total files checked: %d\n", total_files_checked);
+    printf("Total results found: %d\n", result_count);
+    printf("Occurrences of '%s':\n", argv[2]);
+    for (int i = 0; i < result_count; i++) {
+        printf("%s:%d:%d\n", results[i].file_path, results[i].line, results[i].character);
+    }
+
+    // Clean up mutex
+    pthread_mutex_destroy(&result_mutex);
+    return EXIT_SUCCESS;
+}
+
+void process_directory(const char *path, const char *search_str) {
+    DIR *dir = opendir(path); // Open the directory
+    if (!dir) {
+        perror("opendir");
+        return;
+    }
+
+    struct dirent *entry;
+    pthread_t thread_ids[MAX_THREADS]; // Array to store thread IDs
+    int thread_count = 0;
+
+    // Loop through each entry in the directory
+    while ((entry = readdir(dir)) != NULL) {
+        // Check if entry is a directory (excluding "." and "..")
+        if (entry->d_type == DT_DIR) {
+            char new_path[MAX_PATH];
+            if (strcmp(entry->d_name, ".") == 0 || strcmp(entry->d_name, "..") == 0) continue;
+            snprintf(new_path, sizeof(new_path), "%s/%s", path, entry->d_name);
+            process_directory(new_path, search_str); // Recursive call for subdirectory
+        } else if (entry->d_type == DT_REG && thread_count < MAX_THREADS) { // Check if entry is a regular file and thread limit not reached
+            char file_path[MAX_PATH];
+            snprintf(file_path, sizeof(file_path), "%s/%s", path, entry->d_name);
+            file_thread_args *args = malloc(sizeof(file_thread_args)); // Allocate memory for thread arguments
+            strcpy(args->file_path, file_path);
+            args->search_str = strdup(search_str); // Duplicate the search string for the thread
+            args->thread_num = thread_count + 1;   // Assign thread number
+            // Create a new thread to search the file
+            if (pthread_create(&thread_ids[thread_count], NULL, search_file, args) == 0) {
+                thread_count++;
+            } else {
+                perror("pthread_create");
+                free(args->search_str);
+                free(args);
+            }
+        }
+    }
+
+    // Wait for all threads to finish
+    for (int i = 0; i < thread_count; i++) {
+        pthread_join(thread_ids[i], NULL);
+    }
+
+    closedir(dir); // Close the directory
+}
+
+void *search_file(void *arg) {
+    file_thread_args *args = (file_thread_args *)arg;
+    struct timeval start_time, end_time; // Variables to measure execution time
+    regex_t regex; // Variable to store compiled regular expression
+    int reti; // Variable to store return values from regex functions
+
+    // Compile the regular expression
+    reti = regcomp(&regex, args->search_str, REG_EXTENDED);
+    if (reti) {
+        fprintf(stderr, "Could not compile regex\n");
+        free(args->search_str);
+        free(args);
+        return NULL;
+    }
+
+    gettimeofday(&start_time, NULL); // Get the current time (start time)
+
+    printf("Thread #%ld starting regex search in file: %s\n", (long)pthread_self(), args->file_path);
+
+    FILE *file = fopen(args->file_path, "r"); // Open the file for reading
+    if (!file) {
+        perror("fopen");
+        regfree(&regex); // Free the compiled regular expression
+        free(args->search_str);
+        free(args);
+        return NULL;
+    }
+
+    char *line = NULL;
+    size_t len = 0;
+    ssize_t read;
+    int line_number = 1;
+
+    // Read the file line by line
+    while ((read = getline(&line, &len, file)) != -1) {
+        // Execute the regular expression on the current line
+        reti = regexec(&regex, line, 0, NULL, 0);
+        if (!reti) { // If match found
+            pthread_mutex_lock(&result_mutex); // Lock the mutex to access shared resources
+            if (result_count < MAX_THREADS) {
+                add_result(line_number, 1, args->file_path); // Add the result (character position set to 1 for simplicity)
+            }
+            pthread_mutex_unlock(&result_mutex); // Unlock the mutex
+        }
+        line_number++;
+    }
+
+    fclose(file); // Close the file
+    free(line); // Free the memory allocated for the line
+    regfree(&regex); // Free the compiled regular expression
+
+    pthread_mutex_lock(&result_mutex); // Lock the mutex to update the total files checked
+    total_files_checked++;
+    pthread_mutex_unlock(&result_mutex); // Unlock the mutex
+
+    gettimeofday(&end_time, NULL); // Get the current time (end time)
+
+    // Calculate and print the processing time for this thread
+    long seconds = end_time.tv_sec - start_time.tv_sec;
+    long microseconds = end_time.tv_usec - start_time.tv_usec;
+    double elapsed = seconds + microseconds*1e-6;
+
+    printf("Thread #%ld finished regex search in file: %s in %.6f seconds.\n", (long)pthread_self(), args->file_path, elapsed);
+
+    free(args->search_str); // Free the duplicated search string
+    free(args); // Free the memory allocated for thread arguments
+
+    return NULL; // Return NULL as the thread exits
+}
+
+void add_result(int line, int character, const char *file_path) {
+    // This function adds a search result to the results array
+    // It assumes that the result_mutex is already locked by the calling thread
+    if (result_count < MAX_THREADS) { // Check if there's space in the results array
+        results[result_count].line = line; // Set the line number
+        results[result_count].character = character; // Set the character position
+        strcpy(results[result_count].file_path, file_path); // Copy the file path
+        result_count++; // Increment the result count
+    }
+}
