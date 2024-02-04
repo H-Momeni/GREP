@@ -4,6 +4,10 @@ gcc forkmain.c -o myprogram7 -lpthread
 ./myprogram7 /home/hana/Desktop/test/ hello
 
 
+gcc forkmain.c -o myprogram7 -lpthread
+./myprogram7 /home/hana/Desktop/Testt/ "[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+m[a-zA-Z0-9.-]"
+
+
 */
 
 #define _GNU_SOURCE
@@ -45,16 +49,13 @@ typedef struct {
 
 
 const char *name = "shared_total"; // Name of the shared memory object
-//const int SIZE = sizeof(int)*2; // Size of the shared memory object
-//int *total_files_checked; // Pointer to the shared memory object
 shared_data *data; // Pointer to the shared data structure
 
+int proccessid[30]={0};
 
-//search_result results[MAX_THREADS];
-//int result_count = 0;
-//int total_files_checked = 0;
+
 pthread_mutex_t result_mutex;
-pthread_mutex_t total_mutex;
+
 
 
 void *search_file(void *args);
@@ -74,19 +75,28 @@ int main(int argc, char *argv[]) {
     }
 
     pthread_mutex_init(&result_mutex, NULL);
-    pthread_mutex_init(&total_mutex, NULL);
+    
 
     process_directory(argv[1], argv[2]);
+
+
+    int counter=0;
+    while(proccessid[counter]!=0){
+        printf("Child processID %d\n", proccessid[counter]);
+        counter++;
+    }
 
     printf("Total files checked: %d\n", data->total_files_checked);
     printf("Total results found: %d\n", data->result_count);
     printf("Occurrences of '%s':\n", argv[2]);
+
+
     for (int i = 0; i < data->result_count; i++) {
         printf("%s:%d:%d\n", data->results[i].file_path, data->results[i].line, data->results[i].character);
     }
 
     pthread_mutex_destroy(&result_mutex);
-    pthread_mutex_destroy(&total_mutex);
+    
 
     return EXIT_SUCCESS;
 }
@@ -97,7 +107,7 @@ void process_directory(const char *path, const char *search_str) {
         perror("opendir");
         return;
     }
-
+    int num=0;
     struct dirent *entry;
     while ((entry = readdir(dir)) != NULL) {
         if (entry->d_type == DT_DIR) {
@@ -107,10 +117,14 @@ void process_directory(const char *path, const char *search_str) {
 
             pid_t pid = fork();
             if (pid == 0) { // Child process
+                //printf("Child process %d: %s\n", getpid(), new_path);
+               
                 process_subdirectory(new_path, search_str);
                 exit(EXIT_SUCCESS); // Child process exits after processing subdirectory
             } else if (pid > 0) { // Parent process
                 // Optionally wait for child processes here
+                 proccessid[num]=pid;
+                num++;
             } else {
                 perror("fork");
             }
@@ -119,9 +133,6 @@ void process_directory(const char *path, const char *search_str) {
 
     while (wait(NULL) > 0);
 
-   /* while (wait(NULL) > 0){
-        printf("man\n");
-    } // Wait for all child processes to finish*/
 
     closedir(dir);
 }
@@ -196,38 +207,30 @@ void *search_file(void *arg) {
     size_t len = 0;
     ssize_t read;
     int line_number = 1;
+    regmatch_t pmatch[1]; // Array to hold the match positions
 
+    while ((read = getline(&line, &len, file)) != -1) {
+        int offset = 0; // Offset to start searching from in the line
 
-    // while ((read = getline(&line, &len, file)) != -1) {
-    //         char *ptr = line;
-    //         while ((ptr = strstr(ptr, args->search_str)) != NULL){
-    //             // Execute regular expression
-    //             reti = regexec(&regex, line, 0, NULL, 0);
-    //             if (!reti) {
-    //                 pthread_mutex_lock(&result_mutex);
-    //                 if (result_count < MAX_THREADS) {
-    //                     printf("%s:%d:%ld\n", args->file_path , line_number, ptr - line + 1);
-    //                     add_result(line_number, ptr - line + 1, args->file_path); // Match found, character position set to 1 for simplicity
-    //                 }
-    //                 pthread_mutex_unlock(&result_mutex);
-    //                 ptr++;
-    //             }
-    //         }
-    //         line_number++;  
-    //     }
+        // Use a loop to find multiple occurrences in the same line
+        while (regexec(&regex, line + offset, 1, pmatch, 0) == 0) {
+            // The position of the match is relative to the current offset
+            int match_start = pmatch[0].rm_so + offset;
+            int match_end = pmatch[0].rm_eo + offset;
 
-       while ((read = getline(&line, &len, file)) != -1) {
-        // Execute the regular expression on the current line
-        reti = regexec(&regex, line, 0, NULL, 0);
-        if (!reti) { // If match found
             pthread_mutex_lock(&result_mutex); // Lock the mutex to access shared resources
             if (data->result_count < MAX_THREADS) {
-                //printf("%s:%d:%d\n", args->file_path , line_number, 1);
-               // data->result_count++;
-                add_result(line_number, 1, args->file_path); // Add the result (character position set to 1 for simplicity)
+                add_result(line_number, match_start + 1, args->file_path); // Add the result
             }
             pthread_mutex_unlock(&result_mutex); // Unlock the mutex
+
+            // Update offset to search for next occurrence, avoid infinite loop for zero-length matches
+            offset = match_end > match_start ? match_end : match_end + 1;
+
+            // Break if the end of the line has been reached
+            if (line[offset] == '\0') break;
         }
+
         line_number++;
     }
 
@@ -257,26 +260,17 @@ void *search_file(void *arg) {
     return NULL;
 }
 
-// void add_result(int line, int character, const char *file_path) {
-//     pthread_mutex_lock(&total_mutex);
-//     if (result_count < MAX_THREADS) {
-//         results[result_count].line = line;
-//         results[result_count].character = character;
-//         strcpy(results[result_count].file_path, file_path);
-//         result_count++;
-//     }
-//    pthread_mutex_unlock(&total_mutex);
-// }
+
 
 void add_result(int line, int character, const char *file_path) {
-    //pthread_mutex_lock(&result_mutex);
+    
     if (data->result_count < MAX_THREADS) {
         data->results[data->result_count].line = line;
         data->results[data->result_count].character = character;
         strcpy(data->results[data->result_count].file_path, file_path);
         data->result_count++;
     }
-    //pthread_mutex_unlock(&result_mutex);
+   
 }
 
 void initialize_shared_memory() {
