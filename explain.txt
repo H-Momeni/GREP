@@ -68,7 +68,7 @@ int main(int argc, char *argv[]) {
     return EXIT_SUCCESS;
 }
 
-void process_directory(const char *path, const char *search_str) {
+void process_directory(const char *path, const char *search_str) { //استفاده از پوینتر به خاطر اینکه استرینگ هستند و استفاده از کانست برای ثابت بودن. هم چنین بهبود نتیجه به علت اینکه به جای ذخیره ی یک استرینگ طولانی آدرس اون رو به تابع میدهیم
     DIR *dir = opendir(path); // Open the directory
     if (!dir) {
         perror("opendir");
@@ -91,6 +91,11 @@ void process_directory(const char *path, const char *search_str) {
             char file_path[MAX_PATH];
             snprintf(file_path, sizeof(file_path), "%s/%s", path, entry->d_name);
             file_thread_args *args = malloc(sizeof(file_thread_args)); // Allocate memory for thread arguments
+            /*
+            In summary, malloc is used in this context to ensure the args structure remains valid for the duration of its use by the thread, avoiding 
+            potential issues with stack-allocated memory being deallocated too early. It's a key part of working with dynamic memory and multithreading
+             in C, allowing for flexible and safe memory usage across different scopes and lifetimes.
+            */
             strcpy(args->file_path, file_path);
             args->search_str = strdup(search_str); // Duplicate the search string for the thread
             args->thread_num = thread_count + 1;   // Assign thread number
